@@ -1,0 +1,846 @@
+--------------
+/** 03_analysis.sql - Seattle Building Permit Cycle-Time Analysis
+ * Purpose: find cycle-time distributions, trends, bottleneck segments, and headline KPI.
+ * Input: permits_clean (cleaned version of permits_raw by 02_clean.sql and loaded by 00_load.sql from Building_Permits_20260729.csv).  
+ * Output: no tables. Results recorded as comments under each query.
+ * Run: after 00_load, 01_profile, and 02_clean.
+ * Percentiles: nearest-rank (ROW_NUMBER + CEIL(p * n)); MySQL 8 has no PERCENTILE_CONT.
+ * Author: Peter Jeong. Last full rerun: 2026-09-27. **/
+
+USE seattle_building_permit
+--------------
+
+Query OK, 0 rows affected (0.000 sec)
+
+--------------
+/** Block A: overall cycle-time distribution on permits_clean. 
+ * Citywide baseline: the yardstick for every segment below, and evidence for median/p90 over mean.
+ * Predictions: median = 60 days, p90 ~ 300 (5x), mean > median (long right tail).
+**/
+
+WITH ranked AS (
+	SELECT
+		cycle_days
+		,ROW_NUMBER() OVER (ORDER BY cycle_days) AS rn
+		,COUNT(*) OVER () AS n
+	FROM permits_clean
+)
+SELECT
+	MAX(n) AS permits
+	,MAX(CASE WHEN rn = CEIL(0.5 * n) THEN cycle_days END) AS median_days
+	,MAX(CASE WHEN rn = CEIL(0.9 * n) THEN cycle_days END) AS p90_days
+	,ROUND(AVG(cycle_days), 0) AS mean_days
+FROM ranked
+--------------
+
++---------+-------------+----------+-----------+
+| permits | median_days | p90_days | mean_days |
++---------+-------------+----------+-----------+
+|  133560 |          32 |      251 |        94 |
++---------+-------------+----------+-----------+
+1 row in set (0.268 sec)
+
+--------------
+/** Median = 32, p90 = 251, mean = 94. 
+ * Mean 94 ~ 3x median: right-skewed, so median/p90 are the KPIs, not mean.
+ * Permits are issued faster than predicted.
+ * Long tail is heavier than predicted. p90 = 7.8x median vs. predicted 5x.
+ * Half of Seattle's permits are issued within a month, but the slowest 10% wait more than 8 months. 
+ * Hypothesis (test in Block B): the fast majority skipped plan review (only 23.5% had it); slow tail comes from the plan-reviewed minority.
+**/
+
+/** Block B: test the hypothesis.
+ * Purpose: the same median/p90/mean, split by whether the permit went through plan review. If the hypothesis holds,
+ * the no-review group will be fast and the plan-reviewed group will carry the tail.
+ * Predictions: for no plan review group, median = 5 days and p90 = 32. For plan review group, median = 200 and p90 = 400.
+**/
+
+WITH ranked AS (
+	SELECT
+		cycle_days
+		,(total_days_plan_review IS NOT NULL) AS had_plan_review
+		,ROW_NUMBER() OVER(PARTITION BY total_days_plan_review IS NOT NULL ORDER BY cycle_days) AS rn
+		,COUNT(*) OVER(PARTITION BY total_days_plan_review IS NOT NULL) AS n
+	FROM permits_clean
+)
+SELECT 
+	had_plan_review
+	,MAX(n) AS permits
+	,MAX(CASE WHEN rn = CEIL(0.5 * n) THEN cycle_days END) AS median_days
+	,MAX(CASE WHEN rn = CEIL(0.9 * n) THEN cycle_days END) AS p90_days
+	,ROUND(AVG(cycle_days), 0) AS mean_days
+FROM ranked 
+GROUP BY had_plan_review
+--------------
+
++-----------------+---------+-------------+----------+-----------+
+| had_plan_review | permits | median_days | p90_days | mean_days |
++-----------------+---------+-------------+----------+-----------+
+|               0 |  102119 |           7 |      181 |        63 |
+|               1 |   31441 |         115 |      427 |       193 |
++-----------------+---------+-------------+----------+-----------+
+2 rows in set (0.260 sec)
+
+--------------
+/** Had no plan review: median = 7, p90 = 181, and mean = 63.
+ * Had plan review : median = 115, p90 = 427, and mean = 193.
+ * Scorecard: no-review median HIT (7 vs 5), p90 MISS (181 vs 32); review median MISS (115 vs 200), p90 HIT (427 vs 400). 
+ * Plan review splits the typical permit 16x (7 vs. 115 days), the strongest split tested so far.
+ * No-review p90 is 181 days. About 10,000 permits that never saw plan review still took 6+ months. 
+ * The tail is not only a plan-review problem.
+ * Block A hypothesis: half confirmed.
+ * Correction (See Block D2): plan-review time not recorded before ~2017, so this split is confounded by era. Valid redo: Block E.
+***/
+
+/** Block B2:  
+ * Goal: how many permits slower than the citywide p90 (251 days) come from each group? What share of the tail does each group make up?
+ * Predictions: no-review share of slow tail = 20% (80/20 split). 
+ */
+
+SELECT 
+	(total_days_plan_review IS NOT NULL) AS had_plan_review
+	,COUNT(*) AS permits
+	,SUM(cycle_days > 251) AS slow_permits
+	,ROUND(100 * SUM(cycle_days > 251) / COUNT(*), 1) AS pct_of_group_slow
+	,ROUND(100 * SUM(cycle_days > 251) / SUM(SUM(cycle_days > 251)) OVER(), 1) AS pct_of_all_slow
+FROM permits_clean
+GROUP BY had_plan_review
+--------------
+
++-----------------+---------+--------------+-------------------+-----------------+
+| had_plan_review | permits | slow_permits | pct_of_group_slow | pct_of_all_slow |
++-----------------+---------+--------------+-------------------+-----------------+
+|               0 |  102119 |         6110 |               6.0 |            46.1 |
+|               1 |   31441 |         7145 |              22.7 |            53.9 |
++-----------------+---------+--------------+-------------------+-----------------+
+2 rows in set (0.136 sec)
+
+--------------
+/** Slow = cycle_days > 251 (citywide p90, Block A).
+ * 6,110 + 7,145 = 13,255 slow; shares sum to 100.0. 
+ * 6% of no-plan-review group are slow permits. 
+ * 22.7% of plan-review group are slow permits.
+ * 54% of slow permits had plan review. 46% of slow permits had no plan review.
+ * Prediction MISS: 80/20 predicted, 54/46 actual.
+ * Rate vs. share: a plan-reviewed permit is ~4x as likely to be slow, but the no-review group is 3x bigger, so the tail splits nearly evenly.
+ * Block A hypothesis mostly rejected: plan review is a slight majority of the tail, not the tail.
+ * Implication: fixing plan review reaches at most ~half the slow permits; 6,110 slow permits never saw plan review. 
+ * Next: Block C by permit type. 
+ * Correction (See Block D2): plan-review time not recorded before ~2017, so this split is confounded by era. Valid redo: Block E2. 
+**/
+
+/** Block C: median, p90, and slow share by PermitTypeMapped.
+ * Purpose: find which permit type drives cycle time. 
+ * Block B showed that 6,110 slow permits never saw plan review, and permit type is the next place to look for them.
+ * Predictions: demolition permits will have the slowest median because it is the biggest decision. Building permits will have the largest share of the slow tail due to the sheer amount of building permits compared to other permits.
+**/
+
+WITH ranked AS (
+	SELECT
+		PermitTypeMapped
+		,cycle_days
+		,ROW_NUMBER() OVER(PARTITION BY PermitTypeMapped ORDER BY cycle_days) AS rn
+		,COUNT(*) OVER(PARTITION BY PermitTypeMapped) AS n
+	FROM permits_clean
+)
+SELECT
+	PermitTypeMapped
+	,MAX(n) AS permits
+	,MAX(CASE WHEN rn = CEIL(0.5 * n) THEN cycle_days END) AS median_days
+	,MAX(CASE WHEN rn = CEIL(0.9 * n) THEN cycle_days END) AS p90_days
+	,SUM(cycle_days > 251) AS slow_permits
+	,ROUND(100 * SUM(cycle_days > 251) / COUNT(*), 1) AS pct_of_group_slow
+	,ROUND(100 * SUM(cycle_days > 251) / SUM(SUM(cycle_days > 251)) OVER(), 1) AS pct_of_all_slow
+FROM ranked 
+GROUP BY PermitTypeMapped 
+ORDER BY pct_of_all_slow  DESC
+--------------
+
++------------------+---------+-------------+----------+--------------+-------------------+-----------------+
+| PermitTypeMapped | permits | median_days | p90_days | slow_permits | pct_of_group_slow | pct_of_all_slow |
++------------------+---------+-------------+----------+--------------+-------------------+-----------------+
+| Building         |  121280 |          29 |      238 |        11087 |               9.1 |            83.6 |
+| Demolition       |   11739 |          80 |      361 |         2071 |              17.6 |            15.6 |
+| Grading          |     464 |         103 |      441 |           97 |              20.9 |             0.7 |
+| Roof             |      77 |           0 |        0 |            0 |               0.0 |             0.0 |
++------------------+---------+-------------+----------+--------------+-------------------+-----------------+
+4 rows in set (0.580 sec)
+
+--------------
+/** Permit sum = 133,560. Slow permits sum = 13,255 (matches Block B). Verified.
+ * Scorecard:
+ * 	- Prediction 1 (Demolition slowest median): MISS, Grading 103 > Demolition 80, but Grading is n = 464 with 46.9% ghost records (F0), so among reliable types Demolition is slowest.
+ *  - Prediction 2 (Building largest slow share): HIT, 83.6%. 
+ * Percent of all slow permits: 83.6% building, 15.6% demolition, and 0.7% grading.
+ * Percent of slow permits per group: 9.1% of building, 17.6% of demolition, and 20.9% of grading.
+ * Median days: building 29, demolition 80, grading 103, and roof 0.
+ * Share vs. size: Building is 90.8% of permits, but 83.6% of the slow tail (slightly under-represented). Demolition is 8.8% of permits, but 15.6% of the tail (~1.8x over-represented).
+ * Roof: 77 permits, median and p90 = 0 (same-day, over-the-counter). Too small to matter. 
+ * Permit type is too coarse. Building is 91% of everything, so the 6,110 no-review slow permits are likely inside Building. 
+ * Next: Block D splits Building by PermitClassMapped or PermitTypeDesc.
+**/
+
+/** Block D: split Building.
+**/
+
+/** Block D0: choosing how to split Building (121,280).
+ * PermitClassMapped: 3 groups (Residential 84,589 / Non-Residential 33,550 / N/A 3,141). Answers who is building.
+ * PermitTypeDesc: 8 groups, 3 large (Addition/Alteration 92,600 / New 22,336 / Tenant Improvment 4,460).
+ * Answers what kind of work, closer to whether plan review is triggered.
+ * Decision: split by PermitTypeDesc. NONE (304) and blank (22) = unknown type.
+ * "Tenant Improvment" is misspelled in source data. Filter must match it. **/
+SELECT
+	PermitTypeDesc
+	,COUNT(*) AS permits
+FROM permits_clean
+WHERE PermitTypeMapped = 'Building'
+GROUP BY PermitTypeDesc
+ORDER BY permits DESC
+--------------
+
++--------------------------------------+---------+
+| PermitTypeDesc                       | permits |
++--------------------------------------+---------+
+| Addition/Alteration                  |   92600 |
+| New                                  |   22336 |
+| Tenant Improvment                    |    4460 |
+| Temporary                            |     752 |
+| Curb Cut                             |     587 |
+| NONE                                 |     304 |
+| Change of Use Only - No Construction |     219 |
+| NULL                                 |      22 |
++--------------------------------------+---------+
+8 rows in set (0.118 sec)
+
+--------------
+SELECT
+	PermitClassMapped
+	,COUNT(*) AS permits
+FROM permits_clean
+WHERE PermitTypeMapped = 'Building'
+GROUP BY PermitClassMapped
+ORDER BY permits DESC
+--------------
+
++-------------------+---------+
+| PermitClassMapped | permits |
++-------------------+---------+
+| Residential       |   84589 |
+| Non-Residential   |   33550 |
+| N/A               |    3141 |
++-------------------+---------+
+3 rows in set (0.117 sec)
+
+--------------
+/** Block D1: split Building by PermitTypeDesc.
+ * Predictions: 80% of Building's no-review slow permits are Addition/Alteration. New Median = 40, Addition/Alteration Median = 90.
+ */
+WITH ranked AS (
+	SELECT
+		PermitTypeDesc
+		,(total_days_plan_review IS NULL) AS no_plan_review
+		,cycle_days
+		,ROW_NUMBER() OVER(PARTITION BY PermitTypeDesc ORDER BY cycle_days) AS rn
+		,COUNT(*) OVER(PARTITION BY PermitTypeDesc) AS n
+	FROM permits_clean
+	WHERE PermitTypeMapped = 'Building'
+)
+SELECT
+	PermitTypeDesc
+	,MAX(n) AS permits
+	,MAX(CASE WHEN rn = CEIL(0.5 * n) THEN cycle_days END) AS median_days
+	,MAX(CASE WHEN rn = CEIL(0.9 * n) THEN cycle_days END) AS p90_days
+	,SUM(cycle_days > 251) AS slow_permits
+	,ROUND(100 * SUM(cycle_days > 251) / COUNT(*), 1) AS pct_of_group_slow
+	,ROUND(100 * SUM(cycle_days > 251) / SUM(SUM(cycle_days > 251)) OVER(), 1) AS pct_of_all_slow
+	,SUM(cycle_days > 251 AND no_plan_review = 1) AS slow_no_review
+FROM ranked 
+GROUP BY PermitTypeDesc 
+ORDER BY slow_no_review  DESC
+--------------
+
++--------------------------------------+---------+-------------+----------+--------------+-------------------+-----------------+----------------+
+| PermitTypeDesc                       | permits | median_days | p90_days | slow_permits | pct_of_group_slow | pct_of_all_slow | slow_no_review |
++--------------------------------------+---------+-------------+----------+--------------+-------------------+-----------------+----------------+
+| New                                  |   22336 |         182 |      498 |         7426 |              33.2 |            67.0 |           3311 |
+| Addition/Alteration                  |   92600 |           8 |      134 |         3557 |               3.8 |            32.1 |           1325 |
+| NONE                                 |     304 |          21 |      189 |           24 |               7.9 |             0.2 |             22 |
+| Tenant Improvment                    |    4460 |          22 |       66 |           28 |               0.6 |             0.3 |             15 |
+| Temporary                            |     752 |          14 |       93 |           21 |               2.8 |             0.2 |             11 |
+| NULL                                 |      22 |           0 |      290 |            4 |              18.2 |             0.0 |              4 |
+| Change of Use Only - No Construction |     219 |          53 |      278 |           27 |              12.3 |             0.2 |              1 |
+| Curb Cut                             |     587 |           0 |        0 |            0 |               0.0 |             0.0 |              0 |
++--------------------------------------+---------+-------------+----------+--------------+-------------------+-----------------+----------------+
+8 rows in set (0.631 sec)
+
+--------------
+/** Permits = 121,280. Slow = 11,087. Verified.
+ * Slow_no_review = 4,689.
+ * Scorecard:
+ * 	- Prediction 1: 80% of Building's no-review slow permits are Addition/Alteration. MISSED. 28% are Addition/Alteration. 
+ * 	- Prediction 2: New Median = 40, Addition/Alteration Median = 90. MISSED. New Median = 182, Addition/Alteration Median = 8.
+ * Findings: New construction is the slow tail. It's 18% of Building permits, but 67% of Building's slow permits.
+ * 	- A third of all new-construction permits take more than 251 days, and the typical one takes six months.
+ * 	- Alterations are fast (median 8 days). They are slow because there are so many of them.
+ * Red flag: 3,311 new-construction permits "had no plan review", but new construction essentially always gets plan review. 
+ * 	So, total_days_plan_review IS NULL probably doesn't mean "not reviewed." It probably means "review time not recorded." Coverage was only 23.5% (02_clean.sql Block G). 
+ * 	"The 6,110 permits never saw plan review" statement was incorrect. "6,110 slow permits with no recorded review time" is probably correct.
+ * 	See D2: confirmed. slow_no_review is compromised by era. Main finding (New = 67% of slow tail) stands.
+**/
+
+
+/** Block D2: plan-review coverage by applied year, New Building permits (22,336).
+ *  Why: Block D1 found 3,311 slow New permits with no plan review. New construction
+ *  essentially always gets plan review, so NULL may mean "not recorded", not "not reviewed".
+ *  Prediction: cliff around 2016. HIT (two-year ramp, not one-year cliff). **/
+SELECT 
+	YEAR(applied_date) AS year_applied
+	,COUNT(*) AS permit_count
+	,COUNT(total_days_plan_review) AS total_days_plan_review_count
+	,ROUND(100 * COUNT(total_days_plan_review) / COUNT(*), 1) AS pct_with_review
+FROM permits_clean
+WHERE PermitTypeMapped = 'Building' AND PermitTypeDesc = 'New'
+GROUP BY YEAR(applied_date)
+ORDER BY year_applied
+--------------
+
++--------------+--------------+------------------------------+-----------------+
+| year_applied | permit_count | total_days_plan_review_count | pct_with_review |
++--------------+--------------+------------------------------+-----------------+
+|         2006 |         2134 |                            1 |             0.0 |
+|         2007 |         1548 |                            0 |             0.0 |
+|         2008 |          790 |                            0 |             0.0 |
+|         2009 |          351 |                            2 |             0.6 |
+|         2010 |          440 |                            0 |             0.0 |
+|         2011 |          509 |                            0 |             0.0 |
+|         2012 |          926 |                            0 |             0.0 |
+|         2013 |         1444 |                            1 |             0.1 |
+|         2014 |         1475 |                            3 |             0.2 |
+|         2015 |         1413 |                           15 |             1.1 |
+|         2016 |         1420 |                           81 |             5.7 |
+|         2017 |         1338 |                          464 |            34.7 |
+|         2018 |         1335 |                         1116 |            83.6 |
+|         2019 |         1010 |                          950 |            94.1 |
+|         2020 |         1057 |                          978 |            92.5 |
+|         2021 |         1065 |                          987 |            92.7 |
+|         2022 |         1155 |                         1108 |            95.9 |
+|         2023 |          843 |                          782 |            92.8 |
+|         2024 |          918 |                          875 |            95.3 |
+|         2025 |          982 |                          938 |            95.5 |
+|         2026 |          183 |                          156 |            85.2 |
++--------------+--------------+------------------------------+-----------------+
+21 rows in set (0.070 sec)
+
+--------------
+/** Result: 2006-2015 coverage 0.0-1.1%. 2016 5.7%, 2017 34.7%, 2018 onward 92-96%.
+ *  2026 85.2% (partial year). Permit counts sum to 22,336 (matches Block D1).
+ *  8,457 with review time; 13,879 without, almost all applied before 2017.
+ *
+ *  Conclusion: total_days_plan_review was not recorded before ~2017.
+ *  Before 2017, NULL = not tracked, NOT "no plan review".
+ *
+ *  Consequences:
+ *  - Block B is confounded by era: the "no plan review" group is mostly pre-2017 permits,
+ *    the "plan review" group mostly 2017+. Its 54/46 tail split and "6,110 slow permits
+ *    never saw plan review" do not hold as written. Redo the comparison on applied 2018+.
+ *  - Block D slow_no_review column is compromised for the same reason. The main finding
+ *    stands: New is 18% of Building permits but 67% of Building's slow tail, median 182 days.
+ *  - City vs applicant decomposition (days_plan_review_city vs days_out_corrections)
+ *    is only valid for applied 2018+. Add to README Limitations.
+ *  - Resolved in D3: DaysOutCorrections started ~2017 too; pre-2017 zeros mean
+ *    "not tracked", not "no corrections".
+ *
+ *  Sanity check: New volume drops 2,134 (2006) -> 351 (2009), recovers by 2013.
+ *  Matches the Great Recession; the dates reflect real activity. **/
+
+/** Block D3: corrections coverage by applied year, New Building permits (22,336).
+ * Why: D2 showed plan-review time was not recorded before ~2017. 02_clean Block G
+ * trusted days_out_corrections zeros because they lined up with plan-review NULLs.
+ * If corrections also started ~2017, pre-2017 zeros mean "not tracked", not "no corrections". 
+ * Checks: zero vs positive vs NULL per year. Zero + positive + null = permits on every row.
+	Predictions: pct_positive 2010 = 5%, 2020 = 70%.
+**/
+ 
+SELECT 
+	YEAR(applied_date) AS year_applied
+	,COUNT(*) AS permits
+	,SUM(days_out_corrections = 0) AS zero_corrections
+	,SUM(days_out_corrections > 0) AS positive_corrections
+	,SUM(days_out_corrections IS NULL) AS null_corrections
+	,ROUND(100 * SUM(days_out_corrections > 0) / COUNT(*), 1) AS pct_positive
+FROM permits_clean
+WHERE PermitTypeMapped = 'Building' AND PermitTypeDesc = 'New'
+GROUP BY YEAR(applied_date)
+ORDER BY year_applied
+--------------
+
++--------------+---------+------------------+----------------------+------------------+--------------+
+| year_applied | permits | zero_corrections | positive_corrections | null_corrections | pct_positive |
++--------------+---------+------------------+----------------------+------------------+--------------+
+|         2006 |    2134 |             2121 |                    0 |               13 |          0.0 |
+|         2007 |    1548 |             1521 |                    0 |               27 |          0.0 |
+|         2008 |     790 |              778 |                    0 |               12 |          0.0 |
+|         2009 |     351 |              345 |                    1 |                5 |          0.3 |
+|         2010 |     440 |              434 |                    0 |                6 |          0.0 |
+|         2011 |     509 |              509 |                    0 |                0 |          0.0 |
+|         2012 |     926 |              925 |                    0 |                1 |          0.0 |
+|         2013 |    1444 |             1437 |                    1 |                6 |          0.1 |
+|         2014 |    1475 |             1468 |                    4 |                3 |          0.3 |
+|         2015 |    1413 |             1390 |                   11 |               12 |          0.8 |
+|         2016 |    1420 |             1354 |                   60 |                6 |          4.2 |
+|         2017 |    1338 |             1021 |                  311 |                6 |         23.2 |
+|         2018 |    1335 |              333 |                  997 |                5 |         74.7 |
+|         2019 |    1010 |              234 |                  774 |                2 |         76.6 |
+|         2020 |    1057 |              299 |                  749 |                9 |         70.9 |
+|         2021 |    1065 |              352 |                  700 |               13 |         65.7 |
+|         2022 |    1155 |              471 |                  671 |               13 |         58.1 |
+|         2023 |     843 |              376 |                  461 |                6 |         54.7 |
+|         2024 |     918 |              386 |                  526 |                6 |         57.3 |
+|         2025 |     982 |              516 |                  461 |                5 |         46.9 |
+|         2026 |     183 |               90 |                   91 |                2 |         49.7 |
++--------------+---------+------------------+----------------------+------------------+--------------+
+21 rows in set (0.081 sec)
+
+--------------
+/** Result: zero + positive + null = permits on every row. Verified.
+ * Scorecard: 2010 = 0.0% vs. 5% predicted (direction HIT, number high); 2020 = 70.9% vs. 70% HIT.
+ * 2006-2015 positive 0.0 - 0.8%, 2016 4.2%, 2017 23.2%, 2018 onward 42-77%.
+ * Same cliff as plan review (D2).
+ * 
+ * Conclusion: days_out_corrections was not tracked before ~2017. Old records were filled with 0, not NULL,
+ * which is why the 02_clean Block G zero-vs-NULL test passed.
+ * Pre-2017 zero = not tracked, NOT "no corrections". Block G's "zeros are structural" holds only for applied 2018+.
+ * 
+ * Consequences:
+ * - City vs. applicant decomposition limited to applied 2018+ (both fields).
+ * - pct_positive falls 74.7% (2018) -> 46.9% (2025). Possible right-censoring;
+ * 	permits_clean is issued-only, so recent permits still in correction rounds are not in the table yet.
+ * 	Hypothesis, not finding. Test in the trend block. 
+ * - README Limitations: corrections and plan-review timing recorded from ~2017 only. **/
+
+/** Block E: Block B redo on applied 2018+.
+ *  Why: D2 and D3 showed plan-review time and corrections were not recorded before ~2017,
+ *  so Block B's "no plan review" group mixed real no-review permits with unrecorded old ones.
+ *  From 2018 on, coverage is 92-96% (D2), so NULL now mostly means no plan review.
+ *  Filter goes inside the CTE, before ranking, so percentiles are computed on 2018+ only.
+ *  Predictions: no-review p90 = 30, review p90 = 365. **/
+
+WITH ranked AS (
+	SELECT
+		cycle_days
+		,(total_days_plan_review IS NOT NULL) AS had_plan_review
+		,ROW_NUMBER() OVER(PARTITION BY total_days_plan_review IS NOT NULL ORDER BY cycle_days) AS rn
+		,COUNT(*) OVER(PARTITION BY total_days_plan_review IS NOT NULL) AS n
+	FROM permits_clean
+	WHERE YEAR(applied_date) >= 2018 
+)
+SELECT 
+	had_plan_review
+	,MAX(n) AS permits
+	,MAX(CASE WHEN rn = CEIL(0.5 * n) THEN cycle_days END) AS median_days
+	,MAX(CASE WHEN rn = CEIL(0.9 * n) THEN cycle_days END) AS p90_days
+	,ROUND(AVG(cycle_days), 0) AS mean_days
+FROM ranked 
+GROUP BY had_plan_review
+--------------
+
++-----------------+---------+-------------+----------+-----------+
+| had_plan_review | permits | median_days | p90_days | mean_days |
++-----------------+---------+-------------+----------+-----------+
+|               0 |   21493 |           1 |       41 |        25 |
+|               1 |   30577 |         111 |      398 |       181 |
++-----------------+---------+-------------+----------+-----------+
+2 rows in set (0.136 sec)
+
+--------------
+/** Result (applied 2018+, 52,070 permits):
+ *  No plan review: 21,493 permits, median 1, p90 41, mean 25.
+ *  Plan review:    30,577 permits, median 111, p90 398, mean 181.
+ *  Scorecard: no-review p90 41 vs 30 MISS (close); review p90 398 vs 365 MISS (close).
+ *
+ *  Compared with Block B (all years):
+ *  - No-review group collapsed: median 7 -> 1, p90 181 -> 41. Block B's 181-day tail was
+ *    pre-2017 permits with unrecorded review, not slow over-the-counter permits.
+ *  - Review group barely moved (115/427 -> 111/398): it was already mostly 2018+
+ *    (30,577 of 31,441).
+ *  - Plan review splits the typical permit 111x (1 vs 111 days), up from 16x.
+ *  - Plan-reviewed permits are 59% of 2018+ permits, not the 23.5% minority seen in Block B.
+ *
+ *  Block A hypothesis confirmed once the era confound is removed: permits without
+ *  plan review are fast; the tail comes from plan review.
+ *  Caveat: 2024-2026 permits are right-censored (issued-only table).
+ *  Next: Block E2, tail share (B2 redo) on 2018+. **/
+
+/** Block E2: Block B2 redo on applied 2018+ (tail share by plan review).
+ *  Why: B2's 54/46 tail split was confounded by era (D2). Block E showed the
+ *  no-review group is fast once pre-2017 permits are excluded.
+ *  Slow = cycle_days > 251 (citywide p90, Block A), kept for comparability with B2.
+ *  Predictions: 10%, 80% (intended: no-review share of tail, review rate slow). **/
+SELECT 
+	(total_days_plan_review IS NOT NULL) AS had_plan_review
+	,COUNT(*) AS permits
+	,SUM(cycle_days > 251) AS slow_permits
+	,ROUND(100 * SUM(cycle_days > 251) / COUNT(*), 1) AS pct_of_group_slow
+	,ROUND(100 * SUM(cycle_days > 251) / SUM(SUM(cycle_days > 251)) OVER(), 1) AS pct_of_all_slow
+FROM permits_clean
+WHERE YEAR(applied_date) >= 2018
+GROUP BY had_plan_review
+--------------
+
++-----------------+---------+--------------+-------------------+-----------------+
+| had_plan_review | permits | slow_permits | pct_of_group_slow | pct_of_all_slow |
++-----------------+---------+--------------+-------------------+-----------------+
+|               0 |   21493 |          648 |               3.0 |             9.2 |
+|               1 |   30577 |         6422 |              21.0 |            90.8 |
++-----------------+---------+--------------+-------------------+-----------------+
+2 rows in set (0.088 sec)
+
+--------------
+/** Result (applied 2018+): 648 + 6,422 = 7,070 slow; shares sum to 100.0. Verified.
+ *  No plan review: 3.0% of group slow, 9.2% of all slow.
+ *  Plan review:   21.0% of group slow, 90.8% of all slow.
+ *  Scorecard: no-review share 10% vs 9.2% HIT. 80% MISS: actual review rate is 21.0%,
+ *  review share is 90.8% (rate vs share mixed up again).
+ *
+ *  Compared with B2 (all years): plan-review share of the tail 54% -> 91%.
+ *  B2's near-even split was the era confound, not a real pattern.
+ *  A plan-reviewed permit is 7x as likely to be slow (21.0 vs 3.0) and is now the
+ *  larger group, so rate and share point the same way.
+ *
+ *  Conclusion: the slow tail is a plan-review problem. Fixing plan review reaches ~91%
+ *  of slow permits, not ~half as B2 suggested.
+ *  Side note for Block G: 13.6% of 2018+ permits exceed 251 days vs 9.9% all years.
+ *  Recent era is slower despite right-censoring biasing it faster.
+ *  Next: Block F, city vs applicant days inside plan review.
+**/
+
+
+/** Block F: city vs applicant time inside plan review (headline).
+ *  Scope for every F query: applied 2018+ (D2, D3), plan review recorded, and
+ *  total_days_plan_review >= 0 (02_clean Block H found 81 impossible negatives).
+ *  Fields: total_days_plan_review = days the permit sat in plan review.
+ *          days_plan_review_city   = days the city held it (reviewing).
+ *          days_out_corrections    = days the applicant held it (fixing corrections).
+ **/
+
+/** Block F0: does total = city + applicant? Must hold before splitting the total.
+ *  Expected: most rows add up. Rows that don't should have city + applicant > total (the 7,624-day migration artifact is one). **/
+SELECT
+	COUNT(*) AS plan_reviewed
+	,SUM(ABS(total_days_plan_review - days_plan_review_city - days_out_corrections) <= 1) AS adds_up
+	,SUM(ABS(total_days_plan_review - days_plan_review_city - days_out_corrections) > 1) AS does_not_add_up
+	,SUM(days_plan_review_city IS NULL OR days_out_corrections IS NULL) AS missing_a_part
+	,SUM(total_days_plan_review <= cycle_days) AS review_within_cycle
+FROM permits_clean
+WHERE YEAR(applied_date) >= 2018
+	AND total_days_plan_review >= 0
+--------------
+
++---------------+---------+-----------------+----------------+---------------------+
+| plan_reviewed | adds_up | does_not_add_up | missing_a_part | review_within_cycle |
++---------------+---------+-----------------+----------------+---------------------+
+|         30496 |   29761 |             735 |              0 |               30408 |
++---------------+---------+-----------------+----------------+---------------------+
+1 row in set (0.078 sec)
+
+--------------
+/** Result: 30,496 plan-reviewed permits (= Block E 30,577 minus the 81 negatives). Verified.
+ *  Adds up (within 1 day): 29,761 (97.6%).
+ *  Does not add up: 735 (2.4%). Missing a part: 0.
+ *  Review longer than the whole cycle: 88 (0.3%); left in, too few to move a median.
+ *  Decision: F1-G2 use the 29,761 rows that add up. **/
+
+/** Block F1: median / p90 / mean of each piece, rows that add up only (F0).
+ *  Long format (UNION ALL) so one window ranks all four measures, partitioned by measure. **/
+WITH base AS (
+	SELECT
+		cycle_days
+		,total_days_plan_review
+		,days_plan_review_city
+		,days_out_corrections
+	FROM permits_clean
+	WHERE YEAR(applied_date) >= 2018
+		AND total_days_plan_review >= 0
+		AND ABS(total_days_plan_review - days_plan_review_city - days_out_corrections) <= 1
+)
+,long_form AS (
+	SELECT '1 cycle (applied to issued)' AS measure, cycle_days AS days FROM base
+	UNION ALL SELECT '2 plan review total', total_days_plan_review FROM base
+	UNION ALL SELECT '3 city side', days_plan_review_city FROM base
+	UNION ALL SELECT '4 applicant side', days_out_corrections FROM base
+)
+,ranked AS (
+	SELECT
+		measure
+		,days
+		,ROW_NUMBER() OVER(PARTITION BY measure ORDER BY days) AS rn
+		,COUNT(*) OVER(PARTITION BY measure) AS n
+	FROM long_form
+)
+SELECT
+	measure
+	,MAX(n) AS permits
+	,MAX(CASE WHEN rn = CEIL(0.5 * n) THEN days END) AS median_days
+	,MAX(CASE WHEN rn = CEIL(0.9 * n) THEN days END) AS p90_days
+	,ROUND(AVG(days), 0) AS mean_days
+FROM ranked
+GROUP BY measure
+ORDER BY measure
+--------------
+
++-----------------------------+---------+-------------+----------+-----------+
+| measure                     | permits | median_days | p90_days | mean_days |
++-----------------------------+---------+-------------+----------+-----------+
+| 1 cycle (applied to issued) |   29761 |       110.0 |    393.0 |       180 |
+| 2 plan review total         |   29761 |        93.0 |    354.0 |       159 |
+| 3 city side                 |   29761 |        54.0 |    195.0 |        92 |
+| 4 applicant side            |   29761 |        20.0 |    172.0 |        67 |
++-----------------------------+---------+-------------+----------+-----------+
+4 rows in set (0.769 sec)
+
+--------------
+/** Result (29,761 permits, applied 2018+):
+ *  Cycle:          median 110, p90 393, mean 180.
+ *  Review total:   median  93, p90 354, mean 159.
+ *  City side:      median  54, p90 195, mean  92.
+ *  Applicant side: median  20, p90 172, mean  67.
+ *  Check: means add up (92 + 67 = 159). Medians do not (54 + 20 != 93); medians are not additive.
+ *  Dropping the 735 rows that do not add up barely moved the cycle (Block E plan review: 111 / 398).
+ *
+ *  Findings:
+ *  - Plan review is 88% of the cycle (mean 159 of 180 days).
+ *  - The city holds 58% of review days (92 of 159), the applicant 42%.
+ *  - Typical permit: city 54 days vs applicant 20. The city side is the bigger block.
+ *  - Applicant side is the most skewed piece: p90 = 8.6x median (city 3.6x).
+ *    Most applicants turn corrections around fast; a minority take months. **/
+
+/** Block F1b: who holds the days, slow tail vs the rest.
+ *  Shares are of summed days (where the time goes), not of permit counts.
+ *  Slow = cycle_days > 251 (citywide p90, Block A). **/
+SELECT
+	(cycle_days > 251) AS slow
+	,COUNT(*) AS permits
+	,ROUND(100 * SUM(total_days_plan_review) / SUM(cycle_days), 1) AS pct_cycle_in_review
+	,ROUND(100 * SUM(days_plan_review_city) / SUM(total_days_plan_review), 1) AS pct_review_city
+	,ROUND(100 * SUM(days_out_corrections) / SUM(total_days_plan_review), 1) AS pct_review_applicant
+	,ROUND(100 * SUM(days_out_corrections > days_plan_review_city) / COUNT(*), 1) AS pct_applicant_longer
+	,ROUND(AVG(number_review_cycles), 1) AS avg_review_cycles
+FROM permits_clean
+WHERE YEAR(applied_date) >= 2018
+	AND total_days_plan_review >= 0
+	AND ABS(total_days_plan_review - days_plan_review_city - days_out_corrections) <= 1
+GROUP BY slow
+ORDER BY slow
+--------------
+
++------+---------+---------------------+-----------------+----------------------+----------------------+-------------------+
+| slow | permits | pct_cycle_in_review | pct_review_city | pct_review_applicant | pct_applicant_longer | avg_review_cycles |
++------+---------+---------------------+-----------------+----------------------+----------------------+-------------------+
+|    0 |   23582 |                89.4 |            66.6 |                 33.4 |                 19.6 |               2.3 |
+|    1 |    6179 |                88.2 |            51.0 |                 49.0 |                 49.7 |               3.4 |
++------+---------+---------------------+-----------------+----------------------+----------------------+-------------------+
+2 rows in set (0.103 sec)
+
+--------------
+/** Result: 23,582 + 6,179 = 29,761. Verified. Slow = 20.8% (Block E2: 21.0%).
+ *                       not slow   slow
+ *  % of cycle in review    89.4    88.2
+ *  City share of review    66.6    51.0
+ *  Applicant share         33.4    49.0
+ *  Applicant held it longer 19.6%  49.7%
+ *  Avg review cycles        2.3     3.4
+ *
+ *  Findings:
+ *  - Review is ~88-89% of the cycle for both groups. Slow permits are slow inside plan review.
+ *  - In normal permits the city holds two-thirds of review time. In the slow tail it is 51/49:
+ *    applicant time grows the most.
+ *  - Slow permits average 3.4 review rounds vs 2.3. Each extra correction round adds applicant time
+ *    AND another city re-review.
+ *  - Implication: the slow tail is a correction-loop problem, shared by both sides. Speeding up the
+ *    city queue alone reaches about half of slow-permit review time; fewer rounds reaches both halves. **/
+
+/** Block F2: the same split for the three large Building work types (D0).
+ *  Question: is New construction slow (D1) because of the city or the applicant? **/
+WITH ranked AS (
+	SELECT
+		PermitTypeDesc
+		,cycle_days
+		,total_days_plan_review
+		,days_plan_review_city
+		,days_out_corrections
+		,ROW_NUMBER() OVER(PARTITION BY PermitTypeDesc ORDER BY cycle_days) AS rn_cycle
+		,ROW_NUMBER() OVER(PARTITION BY PermitTypeDesc ORDER BY days_plan_review_city) AS rn_city
+		,ROW_NUMBER() OVER(PARTITION BY PermitTypeDesc ORDER BY days_out_corrections) AS rn_applicant
+		,COUNT(*) OVER(PARTITION BY PermitTypeDesc) AS n
+	FROM permits_clean
+	WHERE PermitTypeMapped = 'Building'
+		AND PermitTypeDesc IN ('New', 'Addition/Alteration', 'Tenant Improvment')
+		AND YEAR(applied_date) >= 2018
+		AND total_days_plan_review >= 0
+		AND ABS(total_days_plan_review - days_plan_review_city - days_out_corrections) <= 1
+)
+SELECT
+	PermitTypeDesc
+	,MAX(n) AS permits
+	,MAX(CASE WHEN rn_cycle = CEIL(0.5 * n) THEN cycle_days END) AS median_cycle
+	,MAX(CASE WHEN rn_city = CEIL(0.5 * n) THEN days_plan_review_city END) AS median_city
+	,MAX(CASE WHEN rn_applicant = CEIL(0.5 * n) THEN days_out_corrections END) AS median_applicant
+	,ROUND(100 * SUM(days_plan_review_city) / SUM(total_days_plan_review), 1) AS pct_review_city
+	,ROUND(100 * SUM(days_out_corrections) / SUM(total_days_plan_review), 1) AS pct_review_applicant
+	,ROUND(100 * SUM(cycle_days > 251) / COUNT(*), 1) AS pct_slow
+FROM ranked
+GROUP BY PermitTypeDesc
+ORDER BY permits DESC
+--------------
+
++---------------------+---------+--------------+-------------+------------------+-----------------+----------------------+----------+
+| PermitTypeDesc      | permits | median_cycle | median_city | median_applicant | pct_review_city | pct_review_applicant | pct_slow |
++---------------------+---------+--------------+-------------+------------------+-----------------+----------------------+----------+
+| Addition/Alteration |   17394 |           84 |        45.0 |             19.0 |            51.0 |                 49.0 |     11.3 |
+| New                 |    7585 |          236 |       147.0 |             45.0 |            64.2 |                 35.8 |     45.8 |
+| Tenant Improvment   |    1412 |           28 |        12.0 |              0.0 |            63.6 |                 36.4 |      0.8 |
++---------------------+---------+--------------+-------------+------------------+-----------------+----------------------+----------+
+3 rows in set (0.320 sec)
+
+--------------
+/** Result: 17,394 + 7,585 + 1,412 = 26,391 (the other 3,370 are other Building types and non-Building).
+ *  Addition/Alteration: cycle 84,  city 45,  applicant 19, city share 51.0%, slow 11.3%.
+ *  New:                 cycle 236, city 147, applicant 45, city share 64.2%, slow 45.8%.
+ *  Tenant Improvment:   cycle 28,  city 12,  applicant 0,  city share 63.6%, slow 0.8%.
+ *
+ *  Findings:
+ *  - New construction is slow mostly on the city side: median city time 147 days is 3.3x
+ *    Addition/Alteration (45), while applicant time is 2.4x (45 vs 19).
+ *  - A New permit's typical city time alone (147) is longer than a whole Addition/Alteration cycle (84).
+ *  - Almost half of plan-reviewed New permits (45.8%) are slow.
+ *  - Contrast with F1b: across the slow tail the applicant share grows, but New is city-driven.
+ *    The tail has two sources: New permits (long city review) and repeated correction rounds.
+ *  Caveat: city days = queue + review. Bigger plans need longer review, so this measures where the
+ *  time sits, not city efficiency. **/
+
+/** Block G: trend by applied year.
+ *  Right-censoring: the extract is dated 2026-07-29 and permits_clean is issued-only, so
+ *  slow permits applied in 2025-2026 are not issued yet and missing. Those years look
+ *  faster than they are. Read 2024 with caution and 2025-2026 as a floor, not a value. **/
+
+/** Block G1: cycle time by applied year, all permits (2006+). **/
+WITH ranked AS (
+	SELECT
+		YEAR(applied_date) AS year_applied
+		,cycle_days
+		,ROW_NUMBER() OVER(PARTITION BY YEAR(applied_date) ORDER BY cycle_days) AS rn
+		,COUNT(*) OVER(PARTITION BY YEAR(applied_date)) AS n
+	FROM permits_clean
+)
+SELECT
+	year_applied
+	,MAX(n) AS permits
+	,MAX(CASE WHEN rn = CEIL(0.5 * n) THEN cycle_days END) AS median_days
+	,MAX(CASE WHEN rn = CEIL(0.9 * n) THEN cycle_days END) AS p90_days
+	,ROUND(100 * SUM(cycle_days > 251) / COUNT(*), 1) AS pct_slow
+FROM ranked
+GROUP BY year_applied
+ORDER BY year_applied
+--------------
+
++--------------+---------+-------------+----------+----------+
+| year_applied | permits | median_days | p90_days | pct_slow |
++--------------+---------+-------------+----------+----------+
+|         2006 |    8075 |          23 |      272 |     11.5 |
+|         2007 |    7219 |          23 |      222 |      8.1 |
+|         2008 |    5948 |          16 |      178 |      6.5 |
+|         2009 |    4762 |           8 |      119 |      3.8 |
+|         2010 |    5112 |          13 |      110 |      3.1 |
+|         2011 |    5493 |          15 |      131 |      3.6 |
+|         2012 |    5868 |          20 |      143 |      4.0 |
+|         2013 |    7244 |          29 |      181 |      5.5 |
+|         2014 |    7448 |          34 |      212 |      7.4 |
+|         2015 |    7895 |          39 |      218 |      7.5 |
+|         2016 |    8167 |          40 |      254 |     10.3 |
+|         2017 |    8259 |          40 |      306 |     13.8 |
+|         2018 |    8001 |          41 |      363 |     18.0 |
+|         2019 |    7150 |          35 |      305 |     13.2 |
+|         2020 |    6069 |          48 |      345 |     15.9 |
+|         2021 |    6575 |          56 |      355 |     17.3 |
+|         2022 |    6175 |          62 |      362 |     17.1 |
+|         2023 |    5097 |          55 |      294 |     12.8 |
+|         2024 |    5513 |          54 |      265 |     10.8 |
+|         2025 |    5426 |          52 |      208 |      5.0 |
+|         2026 |    2064 |          17 |       94 |      0.0 |
++--------------+---------+-------------+----------+----------+
+21 rows in set (0.271 sec)
+
+--------------
+/** Result: permits sum to 133,560 (matches permits_clean). Verified.
+ *  2006-2009: median 23 -> 8 as volume fell (Great Recession, D2).
+ *  2010-2022: median climbs every era, 13 -> 62 days. p90 110 (2010) -> 363 (2018) / 362 (2022).
+ *  Peak slow share 18.0% (2018); 2017-2022 run 13-18% vs 3-11% for 2006-2015.
+ *  2023-2024: median 54-55, slow 12.8% / 10.8%. A 2024 permit has had 575+ days to be issued,
+ *    so only its slowest cases can be missing: the decline is likely partly real.
+ *  2025-2026: censored. 2026 slow = 0.0 is forced (no 2026 permit can be 251 days old by 7/29/2026).
+ *
+ *  Findings:
+ *  - The typical permit took 13 days in 2010 and 62 at the 2022 peak (~5x); 2023-2024 sit near 55.
+ *  - Confirms the E2 side note: the recent era is slower, not an artifact of plan-review tracking
+ *    (cycle_days uses applied/issued dates, recorded in every year).
+ *  - 2020 jump (35 -> 48) lines up with COVID; the rise continued after it. **/
+
+/** Block G2: city vs applicant by applied year, plan-reviewed 2018+ (F scope).
+ *  Tests the D3 note (corrections share falling 2018 -> 2025): real change or censoring? **/
+WITH ranked AS (
+	SELECT
+		YEAR(applied_date) AS year_applied
+		,total_days_plan_review
+		,days_plan_review_city
+		,days_out_corrections
+		,ROW_NUMBER() OVER(PARTITION BY YEAR(applied_date) ORDER BY days_plan_review_city) AS rn_city
+		,ROW_NUMBER() OVER(PARTITION BY YEAR(applied_date) ORDER BY days_out_corrections) AS rn_applicant
+		,COUNT(*) OVER(PARTITION BY YEAR(applied_date)) AS n
+	FROM permits_clean
+	WHERE YEAR(applied_date) >= 2018
+		AND total_days_plan_review >= 0
+		AND ABS(total_days_plan_review - days_plan_review_city - days_out_corrections) <= 1
+)
+SELECT
+	year_applied
+	,MAX(n) AS permits
+	,MAX(CASE WHEN rn_city = CEIL(0.5 * n) THEN days_plan_review_city END) AS median_city
+	,MAX(CASE WHEN rn_applicant = CEIL(0.5 * n) THEN days_out_corrections END) AS median_applicant
+	,ROUND(100 * SUM(days_out_corrections) / SUM(total_days_plan_review), 1) AS pct_review_applicant
+FROM ranked
+GROUP BY year_applied
+ORDER BY year_applied
+--------------
+
++--------------+---------+-------------+------------------+----------------------+
+| year_applied | permits | median_city | median_applicant | pct_review_applicant |
++--------------+---------+-------------+------------------+----------------------+
+|         2018 |    3325 |        86.0 |             21.0 |                 39.0 |
+|         2019 |    3693 |        55.0 |             18.0 |                 45.3 |
+|         2020 |    3609 |        54.0 |             26.0 |                 45.9 |
+|         2021 |    3902 |        65.0 |             23.0 |                 42.1 |
+|         2022 |    3832 |        60.0 |             24.0 |                 39.2 |
+|         2023 |    3317 |        41.0 |             22.0 |                 49.3 |
+|         2024 |    3560 |        47.0 |             19.0 |                 43.1 |
+|         2025 |    3516 |        47.0 |             13.0 |                 34.7 |
+|         2026 |    1007 |        32.0 |              7.0 |                 28.4 |
++--------------+---------+-------------+------------------+----------------------+
+9 rows in set (0.167 sec)
+
+--------------
+/** Result: permits sum to 29,761 (matches F1). Verified.
+ *  City median: 86 (2018), then 41-65 for 2019-2023, 47 for 2024-2025.
+ *  Applicant median: 18-26 for 2018-2024, then 13 (2025), 7 (2026).
+ *  Applicant share: 39-49% for 2018-2024 with no trend, then 34.7% (2025), 28.4% (2026).
+ *
+ *  Verdict on the D3 note (corrections falling 2018 -> 2025): censoring, not a real change.
+ *  - 2018-2024 the applicant share is flat. The drop appears only in 2025-2026, the censored years.
+ *  - Applicant time is what gets cut off: permits still in correction rounds are not issued yet,
+ *    so they are missing from this issued-only table.
+ *  - City median fell from 86 (2018) to ~47, but 2018 is the first fully tracked year; treat it with care.
+ *  Use 2018-2024 for any trend claim on the split. **/
+--------------
+
+Query OK, 0 rows affected (0.000 sec)
+
+Bye

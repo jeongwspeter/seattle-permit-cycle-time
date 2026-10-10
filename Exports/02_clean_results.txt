@@ -1,0 +1,535 @@
+--------------
+/** 02_clean.sql - Seattle Building Permit Cycle-Time Analysis
+ *  Purpose: build the analysis table: one row per issued permit with a trustworthy cycle time.
+ *  Input:   permits_raw (191,830 rows, loaded by 00_load.sql from Building_Permits_20260729.csv).
+ *  Output:  permits_clean (133,560 rows): typed dates, cycle_days, post_issue_stage, five review-timing columns.
+ *  Run:     after 00_load and 01_profile; reruns top to bottom (Block A builds a diagnostic table, Block D replaces it).
+ *  Author:  Peter Jeong. Last full rerun: 260925. **/
+
+USE seattle_building_permit
+--------------
+
+Query OK, 0 rows affected (0.000 sec)
+
+--------------
+DROP TABLE IF EXISTS permits_clean
+--------------
+
+Query OK, 0 rows affected (0.010 sec)
+
+--------------
+/** Block A: Unfiltered build for diagnostics. **/
+CREATE TABLE permits_clean AS 
+SELECT
+	PermitNum
+	,PermitClassMapped
+	,PermitTypeMapped
+	,PermitTypeDesc
+	,StatusCurrent
+	,CAST(AppliedDate AS DATE) AS applied_date
+	,CAST(IssuedDate AS DATE)  AS issued_date
+	,DATEDIFF(CAST(IssuedDate AS DATE), CAST(AppliedDate AS DATE))    AS cycle_days
+FROM permits_raw
+WHERE AppliedDate IS NOT NULL AND IssuedDate IS NOT NULL
+--------------
+
+Query OK, 137375 rows affected (1.122 sec)
+Records: 137375  Duplicates: 0  Warnings: 0
+
+--------------
+/** Block A verification **/ 
+SELECT COUNT(*) FROM permits_clean
+--------------
+
++----------+
+| COUNT(*) |
++----------+
+|   137375 |
++----------+
+1 row in set (0.004 sec)
+
+--------------
+SELECT MIN(cycle_days) AS min_days, MAX(cycle_days) AS max_days FROM permits_clean
+--------------
+
++----------+----------+
+| min_days | max_days |
++----------+----------+
+|     -699 |     6226 |
++----------+----------+
+1 row in set (0.057 sec)
+
+--------------
+SELECT COUNT(*) FROM permits_clean WHERE cycle_days < 0
+--------------
+
++----------+
+| COUNT(*) |
++----------+
+|       14 |
++----------+
+1 row in set (0.049 sec)
+
+--------------
+/** 137,375. -699, 6,226. 14. 14 negative cycle_days (issued before applied). **/
+
+/** Block B: date-integrity checks. Negatives, long tail, and applied-year volume. **/
+SELECT
+	PermitNum
+	,StatusCurrent
+	,PermitTypeMapped
+	,applied_date
+	,issued_date
+	,cycle_days
+FROM permits_clean
+WHERE cycle_days < 0
+ORDER BY cycle_days ASC
+--------------
+
++------------+--------------------+------------------+--------------+-------------+------------+
+| PermitNum  | StatusCurrent      | PermitTypeMapped | applied_date | issued_date | cycle_days |
++------------+--------------------+------------------+--------------+-------------+------------+
+| 6070969-CN | Completed          | Building         | 2005-09-28   | 2003-10-30  |       -699 |
+| 6105746-CN | Completed          | Building         | 2006-07-25   | 2005-01-20  |       -551 |
+| 6099383-CN | Completed          | Building         | 2006-05-22   | 2004-11-24  |       -544 |
+| 6106832-CN | Completed          | Building         | 2006-07-25   | 2005-02-02  |       -538 |
+| 6082770-CN | Completed          | Building         | 2005-03-04   | 2004-05-06  |       -302 |
+| 6074822-CN | Completed          | Building         | 2004-10-08   | 2004-04-01  |       -190 |
+| 6129700-CN | Completed          | Building         | 2005-11-18   | 2005-05-23  |       -179 |
+| 6106096-CN | Canceled           | Building         | 2005-06-17   | 2005-01-14  |       -154 |
+| 6108009-CN | Completed          | Building         | 2004-06-11   | 2004-02-10  |       -122 |
+| 6731460-CN | Reviews In Process | Building         | 2020-02-20   | 2019-10-30  |       -113 |
+| 6069714-CN | Completed          | Building         | 2003-08-21   | 2003-05-21  |        -92 |
+| 6082498-CN | Completed          | Building         | 2003-06-20   | 2003-04-14  |        -67 |
+| 6917270-CN | Completed          | Building         | 2022-09-27   | 2022-09-20  |         -7 |
+| 6684170-CN | Expired            | Building         | 2018-08-18   | 2018-08-17  |         -1 |
++------------+--------------------+------------------+--------------+-------------+------------+
+14 rows in set (0.063 sec)
+
+--------------
+SELECT
+	PermitNum
+	,StatusCurrent
+	,PermitTypeMapped
+	,applied_date
+	,issued_date
+	,cycle_days
+FROM permits_clean
+ORDER BY cycle_days DESC LIMIT 20
+--------------
+
++------------+---------------+------------------+--------------+-------------+------------+
+| PermitNum  | StatusCurrent | PermitTypeMapped | applied_date | issued_date | cycle_days |
++------------+---------------+------------------+--------------+-------------+------------+
+| 6118172-CN | Completed     | Building         | 1988-04-15   | 2005-05-02  |       6226 |
+| 6099343-CN | Expired       | Building         | 1989-02-27   | 2004-11-22  |       5747 |
+| 6094764-CN | Completed     | Building         | 1989-07-26   | 2004-10-13  |       5558 |
+| 6104102-CN | Completed     | Building         | 1990-03-21   | 2004-12-23  |       5391 |
+| 6118168-CN | Issued        | Building         | 1990-09-21   | 2005-05-02  |       5337 |
+| 6102952-CN | Completed     | Building         | 1990-05-31   | 2004-12-30  |       5327 |
+| 6068128-CN | Expired       | Building         | 1990-05-17   | 2004-01-22  |       4998 |
+| 6087118-CN | Expired       | Building         | 1990-11-29   | 2004-05-19  |       4920 |
+| 6076283-CN | Completed     | Building         | 1990-11-29   | 2004-04-14  |       4885 |
+| 6122192-CN | Completed     | Building         | 1992-03-25   | 2005-06-09  |       4824 |
+| 6106693-CN | Completed     | Building         | 1992-01-18   | 2005-01-19  |       4750 |
+| 6207150-CN | Issued        | Building         | 2009-03-18   | 2022-03-07  |       4737 |
+| 6918089-DM | Expired       | Demolition       | 2009-03-18   | 2022-03-07  |       4737 |
+| 6211046-CN | Issued        | Building         | 2009-03-18   | 2022-03-07  |       4737 |
+| 6095785-CN | Completed     | Building         | 1992-06-18   | 2004-10-29  |       4516 |
+| 6104993-CN | Completed     | Building         | 1992-11-06   | 2005-01-19  |       4457 |
+| 6072911-CN | Completed     | Building         | 1992-07-02   | 2004-03-19  |       4278 |
+| 6072946-CN | Completed     | Building         | 1992-07-20   | 2004-02-09  |       4221 |
+| 6087470-DM | Completed     | Demolition       | 2006-02-07   | 2017-03-16  |       4055 |
+| 6111022-CN | Completed     | Building         | 1994-08-18   | 2005-03-03  |       3850 |
++------------+---------------+------------------+--------------+-------------+------------+
+20 rows in set (0.073 sec)
+
+--------------
+/** Negatives: applied 2003-2006, all Building. 
+	Long tail: applied 1988-1994, issued 2004-05 (migration stamp).
+	Both in the 606xxxx-613xxxx PermitNum Block. **/
+
+SELECT
+	YEAR(applied_date) AS applied_year
+	,COUNT(*) AS permits
+	,ROUND(AVG(cycle_days), 0) AS avg_days
+FROM permits_clean
+GROUP BY applied_year
+ORDER BY applied_year
+--------------
+
++--------------+---------+----------+
+| applied_year | permits | avg_days |
++--------------+---------+----------+
+|         1986 |       1 |       66 |
+|         1988 |       1 |     6226 |
+|         1989 |       2 |     5653 |
+|         1990 |       6 |     5143 |
+|         1992 |       8 |     3726 |
+|         1994 |       2 |     3718 |
+|         1995 |       4 |     2552 |
+|         1996 |       5 |     2455 |
+|         1997 |       5 |     2474 |
+|         1998 |       7 |     1913 |
+|         1999 |      15 |     1814 |
+|         2000 |      22 |     1599 |
+|         2001 |      37 |     1319 |
+|         2002 |      80 |      738 |
+|         2003 |     167 |      428 |
+|         2004 |     388 |      222 |
+|         2005 |    3059 |      116 |
+|         2006 |    8078 |       94 |
+|         2007 |    7219 |       84 |
+|         2008 |    5948 |       75 |
+|         2009 |    4762 |       54 |
+|         2010 |    5112 |       47 |
+|         2011 |    5493 |       51 |
+|         2012 |    5868 |       56 |
+|         2013 |    7244 |       70 |
+|         2014 |    7448 |       80 |
+|         2015 |    7895 |       87 |
+|         2016 |    8167 |       99 |
+|         2017 |    8259 |      112 |
+|         2018 |    8002 |      132 |
+|         2019 |    7150 |      113 |
+|         2020 |    6070 |      134 |
+|         2021 |    6575 |      136 |
+|         2022 |    6176 |      139 |
+|         2023 |    5097 |      113 |
+|         2024 |    5513 |      101 |
+|         2025 |    5426 |       81 |
+|         2026 |    2064 |       34 |
++--------------+---------+----------+
+38 rows in set (0.089 sec)
+
+--------------
+/** 2005 is the ramp year (388 to 3,059). 2006 is the first full year observed by the current system. 
+    Therefore, applied before 2006 excluded. 
+    Migration-stamped dates, avg_days decays 6,226 to 116 into 2004-05 stamp window.
+    -3,809 rows, 2.8% 
+    Applied years 2025-2026 are incomplete cohorts, only already-issued permits present, flag or drop the last 12 months in 
+    03_analysis. **/
+
+/** Block C: raw-format checks. Every number column is text in permits_raw; check commas, decimals,
+ *  and magnitude before choosing a CAST. **/
+
+SELECT EstProjectCost FROM permits_raw WHERE EstProjectCost IS NOT NULL LIMIT 5
+--------------
+
++----------------+
+| EstProjectCost |
++----------------+
+| 214,000        |
+| 5,759          |
+| 40,000         |
+| 32,928         |
+| 82,358         |
++----------------+
+5 rows in set (0.000 sec)
+
+--------------
+/** Cost is text with thousands separators ('214,000'). Plain CAST stops at the comma and returns 214,
+ *  so REPLACE the commas first. Values carry cents -> DECIMAL, not UNSIGNED. **/
+
+SELECT
+	SUM(DaysOutCorrections LIKE '%,%')  AS doc
+	,SUM(NumberReviewCycles LIKE '%,%')  AS nrc
+	,SUM(TotalDaysPlanReview LIKE '%,%') AS tdpr
+	,SUM(DaysPlanReviewCity LIKE '%,%')  AS dprc
+FROM permits_raw
+--------------
+
++------+------+------+------+
+| doc  | nrc  | tdpr | dprc |
++------+------+------+------+
+| 1251 |    0 |  562 |  215 |
++------+------+------+------+
+1 row in set (0.145 sec)
+
+--------------
+/** 1,251. 0. 562. 215. Day columns carry commas once >= 1,000 -> REPLACE. NumberReviewCycles is clean.
+ *  Day columns also carry half-days ('387.5') and TotalDaysPlanReview has negatives -> DECIMAL(10,1);
+ *  UNSIGNED would silently flip negatives into huge positives. **/
+
+SELECT
+	EstProjectCost
+	,CAST(REPLACE(EstProjectCost, ',', '') AS UNSIGNED) AS est_project_cost
+FROM permits_raw
+WHERE EstProjectCost IS NOT NULL
+ORDER BY est_project_cost DESC
+LIMIT 5
+--------------
+
++----------------+------------------+
+| EstProjectCost | est_project_cost |
++----------------+------------------+
+| 25,000,000,000 |      25000000000 |
+| 25,000,000,000 |      25000000000 |
+| 3,320,000,555  |       3320000555 |
+| 1,443,000,000  |       1443000000 |
+| 1,000,000,000  |       1000000000 |
++----------------+------------------+
+5 rows in set, 872 warnings (0.114 sec)
+
+--------------
+SELECT PermitNum, PermitTypeDesc, LEFT(Description, 60) AS descr, EstProjectCost
+FROM permits_raw
+WHERE CAST(REPLACE(EstProjectCost, ',', '') AS UNSIGNED) >= 1000000000
+--------------
+
++------------+---------------------+--------------------------------------------------------------+----------------+
+| PermitNum  | PermitTypeDesc      | descr                                                        | EstProjectCost |
++------------+---------------------+--------------------------------------------------------------+----------------+
+| 6781194-DM | NULL                | :                                                            | 1,000,000,000  |
+| 6830099-CN | New                 | Master Use Permit to Construct a 4 Story  175 000GSF Surgica | 1,443,000,000  |
+| 6973063-CN | New                 | Building a new 5 story over a 2 story base structure  mixed  | 25,000,000,000 |
+| 6781193-CN | New                 | :                                                            | 1,000,000,000  |
+| 7103217-CN | Addition/Alteration | [LAND USE STATEMENT] Construct alterations to convert tenant | 3,320,000,555  |
+| 6973064-DM | NULL                | Building a new 5 story over a 2 story base structure  mixed  | 25,000,000,000 |
++------------+---------------------+--------------------------------------------------------------+----------------+
+6 rows in set, 872 warnings (0.121 sec)
+
+--------------
+/** Six rows >= $1B in raw, all data-entry errors: two $25B for a 5-story mixed-use (= $25M with three extra
+ *  zeros), a $1B demolition, a $3.3B tenant alteration. Max value exceeds 999,999,999 -> DECIMAL(14,2).
+ *  None of the six survive the Block D scope filter (see Block H). **/
+
+/** Block D: final table **/
+/** Exclusions (evidence in Block B):
+ *  - applied before 2006-01-01: -3,809 (2.8%), pre-migration dates
+ *  - negative cycle_days: -6 after the year cutoff, issued before applied is impossible **/
+
+DROP TABLE IF EXISTS permits_clean
+--------------
+
+Query OK, 0 rows affected (0.010 sec)
+
+--------------
+CREATE TABLE permits_clean AS 
+SELECT
+	PermitNum
+	,PermitClassMapped
+	,PermitTypeMapped
+	,PermitTypeDesc
+	,StatusCurrent
+	,CAST(AppliedDate AS DATE) AS applied_date
+	,CAST(IssuedDate AS DATE)  AS issued_date
+	,DATEDIFF(CAST(IssuedDate AS DATE), CAST(AppliedDate AS DATE))    AS cycle_days
+	,CAST(REPLACE(DaysOutCorrections, ',','') AS DECIMAL(10,1))   AS days_out_corrections
+	,CAST(NumberReviewCycles AS UNSIGNED)   AS number_review_cycles
+	,CAST(REPLACE(TotalDaysPlanReview, ',','') AS DECIMAL(10,1))  AS total_days_plan_review
+	,CAST(REPLACE(DaysPlanReviewCity, ',','') AS DECIMAL(10,1))   AS days_plan_review_city
+	,CAST(REPLACE(EstProjectCost, ',', '') AS DECIMAL(14,2)) AS est_project_cost
+	,CASE 
+		WHEN StatusCurrent IN ('Completed','Expired', 'Closed', 'Approved to Occupy') THEN 'finished'
+		WHEN StatusCurrent IN ('Issued', 'Inspections Completed', 'Phase Issued') THEN 'live'
+		WHEN StatusCurrent IN ('Canceled', 'Withdrawn') THEN 'abandoned'
+		ELSE 'contradiction'
+	END AS post_issue_stage
+FROM permits_raw
+WHERE 
+	AppliedDate IS NOT NULL AND 
+	IssuedDate IS NOT NULL AND 
+	DATEDIFF(CAST(IssuedDate AS DATE), CAST(AppliedDate AS DATE)) >= 0 AND 
+	CAST(AppliedDate AS DATE) >= '2006-01-01'
+--------------
+
+Query OK, 133560 rows affected (1.583 sec)
+Records: 133560  Duplicates: 0  Warnings: 0
+
+--------------
+SELECT COUNT(*) FROM permits_clean
+--------------
+
++----------+
+| COUNT(*) |
++----------+
+|   133560 |
++----------+
+1 row in set (0.006 sec)
+
+--------------
+SELECT MIN(cycle_days) AS min_days, MAX(cycle_days) AS max_days FROM permits_clean
+--------------
+
++----------+----------+
+| min_days | max_days |
++----------+----------+
+|        0 |     4737 |
++----------+----------+
+1 row in set (0.059 sec)
+
+--------------
+SELECT COUNT(*) FROM permits_clean WHERE cycle_days < 0
+--------------
+
++----------+
+| COUNT(*) |
++----------+
+|        0 |
++----------+
+1 row in set (0.051 sec)
+
+--------------
+/** 133,560. 0, 4,737. 0. **/
+
+/** Block E: status distribution on the scoped table. 
+ * Prediction: 80% completed, 10% expired, 5% closed, 3% issued, and 1% withdrawn **/
+SELECT 
+	StatusCurrent
+	,COUNT(*) AS permits
+	,ROUND(COUNT(*)/(SELECT COUNT(*) FROM permits_clean) * 100, 1) as pct
+FROM permits_clean
+GROUP BY StatusCurrent
+ORDER BY permits DESC
+--------------
+
++---------------------------+---------+------+
+| StatusCurrent             | permits | pct  |
++---------------------------+---------+------+
+| Completed                 |  111299 | 83.3 |
+| Expired                   |   12624 |  9.5 |
+| Issued                    |    7959 |  6.0 |
+| Closed                    |     643 |  0.5 |
+| Withdrawn                 |     435 |  0.3 |
+| Canceled                  |     353 |  0.3 |
+| Inspections Completed     |     141 |  0.1 |
+| Awaiting Information      |      38 |  0.0 |
+| Approved to Occupy        |      25 |  0.0 |
+| Phase Issued              |      13 |  0.0 |
+| Reviews Completed         |      12 |  0.0 |
+| Ready for Issuance        |       9 |  0.0 |
+| Reviews In Process        |       3 |  0.0 |
+| Additional Info Requested |       2 |  0.0 |
+| Corrections Required      |       2 |  0.0 |
+| Application Completed     |       1 |  0.0 |
+| Scheduled                 |       1 |  0.0 |
++---------------------------+---------+------+
+17 rows in set (0.109 sec)
+
+--------------
+/** 83.3% completed, 9.5% expired, 6% issued, 0.5% closed, 0.3% canceled, 0.3% withdrawn, 0.1% inspections completed. 
+ * Completed rose after clean up because 58k rows of ghosts data were removed. Therefore, the denominator shrunk. **/
+
+/** Block F: map StatusCurrent to a post-issuance stage for Tableau.
+ * Every row here is issued, so the 17 statuses collapse to 4 buckets by what happened after issuance.
+ * Decisions: 
+ * 	- Reviews Completed (12) -> contradiction. In raw, 449 of 461 Reviews Completed rows have no IssuedDate
+ * 	  (checked against the CSV 2026-09-25), so it is a pre-issuance status; on an issued row it contradicts the dates.
+ * 	- Canceled + Withdrawn (788) -> abandoned. Issued then dropped; cycle time is real, kept in the buckets.
+ * 	- 8 pre-issuance statuses on issued rows (68, incl. the 12 above) -> contradiction via ELSE. Data error, kept and
+ * 	  flagged; 03 decides in/out.
+ * 	- Risk: ELSE hides new or misspelled statuses. Verification GROUP BY below must match the paper tally. **/
+
+SELECT post_issue_stage, COUNT(*) AS permits
+FROM permits_clean
+GROUP BY post_issue_stage 
+ORDER BY post_issue_stage
+--------------
+
++------------------+---------+
+| post_issue_stage | permits |
++------------------+---------+
+| abandoned        |     788 |
+| contradiction    |      68 |
+| finished         |  124591 |
+| live             |    8113 |
++------------------+---------+
+4 rows in set (0.094 sec)
+
+--------------
+/** Finished 124,591. Live 8,113. Abandoned 788. Contradiction 68. Total 133,560. **/
+
+/** Block G: coverage of review-timing columns on the scoped universe. **/
+
+SELECT
+	COUNT(*) AS total
+	,COUNT(DaysOutCorrections) AS has_days_out_corrections
+	,COUNT(TotalDaysPlanReview) AS has_total_plan_review
+	,COUNT(DaysPlanReviewCity) AS has_plan_review_city
+	,COUNT(NumberReviewCycles) AS has_review_cycles
+	,COUNT(EstProjectCost) AS has_est_cost
+	,COUNT(DaysInitialPlanReview) AS has_initial_plan_review
+	,COUNT(DaysIssuePermitCity) AS has_issue_permit_city
+FROM permits_raw pr
+JOIN permits_clean pc ON pr.PermitNum = pc.PermitNum
+--------------
+
++--------+--------------------------+-----------------------+----------------------+-------------------+--------------+-------------------------+-----------------------+
+| total  | has_days_out_corrections | has_total_plan_review | has_plan_review_city | has_review_cycles | has_est_cost | has_initial_plan_review | has_issue_permit_city |
++--------+--------------------------+-----------------------+----------------------+-------------------+--------------+-------------------------+-----------------------+
+| 133560 |                   132187 |                 31441 |                31441 |            132187 |       122351 |                   29919 |                  7353 |
++--------+--------------------------+-----------------------+----------------------+-------------------+--------------+-------------------------+-----------------------+
+1 row in set (0.337 sec)
+
+--------------
+/** 133,560 total. DaysOutCorrections 132,187 (99.0%) = NumberReviewCycles. TotalDaysPlanReview 31,441 (23.5%)
+ *  = DaysPlanReviewCity. EstProjectCost 122,351 (91.6%). DaysInitialPlanReview 29,919. DaysIssuePermitCity 7,353 (5.5%).
+ *  Identical counts = identical populations. Carried into permits_clean: the first five.
+ *  Skipped: DaysInitialPlanReview (a subset of TotalDaysPlanReview), DaysIssuePermitCity (5.5% coverage). **/
+
+SELECT
+	SUM(DaysOutCorrections = '') AS empty_string
+	,SUM(DaysOutCorrections = 0) AS zero
+	,SUM(DaysOutCorrections > 0) AS positive
+FROM permits_raw pr
+JOIN permits_clean pc ON pr.PermitNum = pc.PermitNum
+--------------
+
++--------------+--------+----------+
+| empty_string | zero   | positive |
++--------------+--------+----------+
+|            0 | 108365 |    23822 |
++--------------+--------+----------+
+1 row in set, 1408 warnings (0.305 sec)
+
+--------------
+/** 0. 108,365. 23,822. (Remaining 1,373 are NULL.) Zero vs missing: is a 0 a real "no corrections" or a blank?
+ *  Answered by the plan-review split below. **/
+
+SELECT
+	(TotalDaysPlanReview IS NOT NULL) AS had_plan_review
+	,SUM(DaysOutCorrections > 0) AS positive_corrections
+	,SUM(DaysOutCorrections = 0) AS zero_corrections
+	,COUNT(*) AS permits
+FROM permits_raw pr
+JOIN permits_clean pc ON pr.PermitNum = pc.PermitNum 
+GROUP BY had_plan_review
+--------------
+
++-----------------+----------------------+------------------+---------+
+| had_plan_review | positive_corrections | zero_corrections | permits |
++-----------------+----------------------+------------------+---------+
+|               0 |                   28 |           100718 |  102119 |
+|               1 |                23794 |             7647 |   31441 |
++-----------------+----------------------+------------------+---------+
+2 rows in set, 1408 warnings (0.357 sec)
+
+--------------
+/** 23,794 of the 23,822 positives sit inside the 31,441 plan-reviewed permits (28 outside = noise).
+ *  Zeros outside plan review are structural (no review, so no corrections), so the column is trusted.
+ *  76% of plan-reviewed permits (23,794 / 31,441) had at least one correction round. **/
+
+/** Block H: final verification. **/
+SELECT
+	COUNT(*)                            AS rows_total
+	,MAX(days_out_corrections)          AS max_doc
+	,SUM(total_days_plan_review < 0)    AS negative_plan_review
+	,MAX(est_project_cost)              AS max_cost
+FROM permits_clean
+--------------
+
++------------+---------+----------------------+--------------+
+| rows_total | max_doc | negative_plan_review | max_cost     |
++------------+---------+----------------------+--------------+
+|     133560 |  7624.0 |                   81 | 458767965.00 |
++------------+---------+----------------------+--------------+
+1 row in set (0.075 sec)
+
+--------------
+/** Max cost is $458M, not $25B. Exclude the 81 negative plan review in 03. Max days out of corrections of 7,624 is probably a migration error. **/
+--------------
+
+Query OK, 0 rows affected (0.000 sec)
+
+Bye
